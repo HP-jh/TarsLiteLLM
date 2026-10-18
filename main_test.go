@@ -307,3 +307,43 @@ func TestClient_HasLogger(t *testing.T) {
 		t.Fatal("expected client to have a logger")
 	}
 }
+
+// v1.5.0: connection pool + graceful shutdown tests
+func TestNewClient_HasPooledTransport(t *testing.T) {
+	client := NewClient("", "")
+	tr, ok := client.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected client to use *http.Transport")
+	}
+	if tr.MaxIdleConns != 100 {
+		t.Fatalf("expected MaxIdleConns 100, got %d", tr.MaxIdleConns)
+	}
+	if tr.MaxIdleConnsPerHost != 10 {
+		t.Fatalf("expected MaxIdleConnsPerHost 10, got %d", tr.MaxIdleConnsPerHost)
+	}
+	if tr.MaxConnsPerHost != 50 {
+		t.Fatalf("expected MaxConnsPerHost 50, got %d", tr.MaxConnsPerHost)
+	}
+	if tr.DisableKeepAlives != false {
+		t.Fatal("expected KeepAlives enabled")
+	}
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	client := NewClient(srv.URL, "")
+
+	// Verify server is reachable
+	res, err := client.req(context.Background(), "GET", "/health", nil)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res["status"] != "ok" {
+		t.Fatalf("expected ok, got %v", res["status"])
+	}
+}

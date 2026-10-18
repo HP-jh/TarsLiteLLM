@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-var Version = "1.4.0"
+var Version = "1.5.0"
 const RepoName = "TarsLiteLLM"
 
 var (
@@ -127,9 +127,23 @@ func NewClient(endpoint, apiKey string) *Client {
 	return &Client{
 		Endpoint: strings.TrimRight(endpoint, "/"),
 		APIKey:   apiKey,
-		Client:   &http.Client{Timeout: 30 * time.Second},
+		Client:   newPooledHTTPClient(),
 		Usage:    &UsageTracker{},
 		Logger:   NewLogger(os.Getenv("TARS_LOG_LEVEL")),
+	}
+}
+
+// newPooledHTTPClient returns an http.Client with tuned connection pooling.
+func newPooledHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			MaxConnsPerHost:     50,
+			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   false,
+		},
 	}
 }
 
@@ -269,8 +283,10 @@ func main() {
 				client.ReloadConfig()
 				continue
 			}
-			client.Logger.Infof("shutting down")
-			_ = srv.Close()
+			client.Logger.Infof("shutting down gracefully")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = srv.Shutdown(ctx)
+			cancel()
 			return
 		}
 	}()

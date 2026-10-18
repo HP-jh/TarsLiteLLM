@@ -23,3 +23,9 @@
 - **新增**：`TARS_LOG_LEVEL` 环境变量控制日志级别
 - **优化**：所有内部日志统一走 Logger，重试日志降级为 WARN
 - **测试**：新增 `TestLogger_Levels`、`TestLogger_InfoSuppressedWhenError`、`TestClient_HasLogger`
+
+## v1.5.0 · 集成版本 — 连接池与优雅关闭
+- **新增**：`newPooledHTTPClient()` 返回调优连接池（MaxIdleConns=100 / MaxConnsPerHost=50 / IdleConnTimeout=90s）
+- **新增**：SIGINT/SIGTERM 触发 `srv.Shutdown()`，10s 优雅关闭超时
+- **优化**：Keep-Alive 默认开启，减少连接重建开销
+- **测试**：新增 `TestNewClient_HasPooledTransport`、`TestGracefulShutdown`
