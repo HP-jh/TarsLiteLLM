@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,8 +18,15 @@ import (
 	"time"
 )
 
-var Version = "1.0.0"
+var Version = "1.1.0"
 const RepoName = "TarsLiteLLM"
+
+var (
+	maxRetries     = 3
+	baseDelay      = 200 * time.Millisecond
+	maxDelay       = 5 * time.Second
+	jitterFactor   = 0.2
+)
 
 type Client struct {
 	Endpoint string
@@ -36,14 +45,60 @@ func NewClient(endpoint, apiKey string) *Client {
 	}
 }
 
-func (c *Client) req(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+// reqWithRetry performs HTTP request with exponential backoff retry.
+func (c *Client) reqWithRetry(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		result, err := c.reqOnce(ctx, method, path, body)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		// Don't retry on client errors (4xx)
+		if strings.Contains(err.Error(), "HTTP 4") {
+			return nil, err
+		}
+		if attempt < maxRetries {
+			delay := calculateBackoff(attempt)
+			log.Printf("[%s] retry %d/%d after %v: %v", RepoName, attempt+1, maxRetries, delay, err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+	}
+	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+}
+
+func calculateBackoff(attempt int) time.Duration {
+	// Exponential backoff: baseDelay * 2^attempt
+	delay := float64(baseDelay) * math.Pow(2, float64(attempt))
+	if delay > float64(maxDelay) {
+		delay = float64(maxDelay)
+	}
+	// Add jitter: +/- jitterFactor, but cap at maxDelay
+	jitter := delay * jitterFactor * (2*rand.Float64() - 1)
+	result := delay + jitter
+	if result > float64(maxDelay) {
+		result = float64(maxDelay)
+	}
+	if result < 0 {
+		result = 0
+	}
+	return time.Duration(result)
+}
+
+func (c *Client) reqOnce(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
 	var bodyR io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		bodyR = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.Endpoint+path, bodyR)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
@@ -51,7 +106,9 @@ func (c *Client) req(ctx context.Context, method, path string, body interface{})
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.Client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
@@ -64,6 +121,11 @@ func (c *Client) req(ctx context.Context, method, path string, body interface{})
 	return result, nil
 }
 
+// req is the public API, delegates to reqWithRetry.
+func (c *Client) req(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+	return c.reqWithRetry(ctx, method, path, body)
+}
+
 func loadConfig() map[string]string {
 	return map[string]string{
 		"endpoint": os.Getenv("TARS_MCP_ENDPOINT"),
@@ -72,6 +134,7 @@ func loadConfig() map[string]string {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	version := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *version {
@@ -82,7 +145,9 @@ func main() {
 	client := NewClient(cfg["endpoint"], cfg["api_key"])
 	log.Printf("[%s] starting v%s endpoint=%s", RepoName, Version, cfg["endpoint"])
 	mode := os.Getenv("TARS_MCP_MODE")
-	if mode == "" { mode = "stdio" }
+	if mode == "" {
+		mode = "stdio"
+	}
 	srv := &http.Server{Addr: ":8080", ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { withClient(client, healthHandler)(w, r) })
 	http.HandleFunc("/tools", func(w http.ResponseWriter, r *http.Request) { withClient(client, toolsHandler)(w, r) })
@@ -110,7 +175,10 @@ func withClient(client *Client, fn func(http.ResponseWriter, *http.Request, *Cli
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		fn(w, r, client)
@@ -121,34 +189,42 @@ func healthHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	up := map[string]interface{}{"healthy": false}
-	if _, err := client.req(ctx, "GET", "/health", nil); err == nil { up["healthy"] = true }
+	if _, err := client.req(ctx, "GET", "/health", nil); err == nil {
+		up["healthy"] = true
+	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ok", "version": Version, "name": RepoName, "upstream": up,
-		"time": time.Now().UTC().Format(time.RFC3339),
+		"status":   "ok",
+		"version":  Version,
+		"name":     RepoName,
+		"upstream": up,
+		"time":     time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
 func toolsHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"tools": []map[string]interface{}{
-		{
-			"name":        "litellm_models",
-			"description": "List available models via LiteLLM",
-			"inputSchema": map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{},
-				"required":   []interface{}{},
+			{
+				"name":        "litellm_models",
+				"description": "List available models via LiteLLM",
+				"inputSchema": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+					"required":   []interface{}{},
+				},
 			},
-		},
-		{
-			"name":        "litellm_chat",
-			"description": "Chat completion through LiteLLM proxy",
-			"inputSchema": map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{"messages": map[string]interface{}{"type": "array", "description": "Parameter messages"}, "model": map[string]interface{}{"type": "string", "description": "Parameter model"}},
-				"required":   []interface{}{"model", "messages"},
+			{
+				"name":        "litellm_chat",
+				"description": "Chat completion through LiteLLM proxy",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"messages": map[string]interface{}{"type": "array", "description": "Parameter messages"},
+						"model":    map[string]interface{}{"type": "string", "description": "Parameter model"},
+					},
+					"required": []interface{}{"model", "messages"},
+				},
 			},
-		},
 		},
 	})
 }
@@ -159,7 +235,10 @@ func invokeHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "只接受 POST 请求"})
 		return
 	}
-	var req struct { Tool string `json:"tool"`; Params map[string]interface{} `json:"params"` }
+	var req struct {
+		Tool   string                 `json:"tool"`
+		Params map[string]interface{} `json:"params"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("解析失败：%v", err)})
@@ -177,8 +256,16 @@ func invokeHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
 	case "litellm_chat":
-		if req.Params["model"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：model"}); return }
-		if req.Params["messages"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：messages"}); return }
+		if req.Params["model"] == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：model"})
+			return
+		}
+		if req.Params["messages"] == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：messages"})
+			return
+		}
 		body := map[string]interface{}{"messages": req.Params["messages"], "model": req.Params["model"]}
 		result, err := client.req(ctx, "POST", "/v1/chat/completions", body)
 		if err != nil {
@@ -199,7 +286,9 @@ func runStdioServer(client *Client) {
 	enc := json.NewEncoder(os.Stdout)
 	for {
 		var msg map[string]interface{}
-		if err := dec.Decode(&msg); err != nil { return }
+		if err := dec.Decode(&msg); err != nil {
+			return
+		}
 		id := msg["id"]
 		method, _ := msg["method"].(string)
 		var result map[string]interface{}
@@ -230,8 +319,12 @@ func handleStdioTool(ctx context.Context, client *Client, toolName string, args 
 		data, _ := json.Marshal(result)
 		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": string(data)}}}
 	case "litellm_chat":
-		if args["model"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：model"}}} }
-		if args["messages"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：messages"}}} }
+		if args["model"] == nil {
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：model"}}}
+		}
+		if args["messages"] == nil {
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：messages"}}}
+		}
 		result, err := client.req(ctx, "POST", "/v1/chat/completions", map[string]interface{}{"messages": args["messages"], "model": args["model"]})
 		if err != nil {
 			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("调用失败：%v", err)}}}
