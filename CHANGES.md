@@ -17,3 +17,9 @@
 - **新增**：SIGHUP 信号触发配置热重载，无需重启进程
 - **优化**：`Client.mu` 读写锁保护并发配置更新与请求执行
 - **测试**：新增 `TestReloadConfig`、`TestReloadConfig_Partial`、`TestClientReq_ConcurrentWithReload`
+
+## v1.4.0 · 集成版本 — 分级日志
+- **新增**：`Logger` 结构体，支持 INFO / WARN / ERROR 三级日志
+- **新增**：`TARS_LOG_LEVEL` 环境变量控制日志级别
+- **优化**：所有内部日志统一走 Logger，重试日志降级为 WARN
+- **测试**：新增 `TestLogger_Levels`、`TestLogger_InfoSuppressedWhenError`、`TestClient_HasLogger`

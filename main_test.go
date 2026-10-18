@@ -276,3 +276,34 @@ func TestClientReq_ConcurrentWithReload(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// v1.4.0: leveled logger tests
+func TestLogger_Levels(t *testing.T) {
+	l := NewLogger("info")
+	if l.level != 2 {
+		t.Fatalf("expected level 2 (info), got %d", l.level)
+	}
+	l.SetLevel("error")
+	if l.level != 0 {
+		t.Fatalf("expected level 0 (error), got %d", l.level)
+	}
+	l.SetLevel("warn")
+	if l.level != 1 {
+		t.Fatalf("expected level 1 (warn), got %d", l.level)
+	}
+}
+
+func TestLogger_InfoSuppressedWhenError(t *testing.T) {
+	l := NewLogger("error")
+	// Should not panic and should not produce output (we just verify no panic)
+	l.Infof("this should not print")
+	l.Warnf("this should not print")
+	l.Errorf("this may print")
+}
+
+func TestClient_HasLogger(t *testing.T) {
+	client := NewClient("", "")
+	if client.Logger == nil {
+		t.Fatal("expected client to have a logger")
+	}
+}

@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-var Version = "1.3.0"
+var Version = "1.4.0"
 const RepoName = "TarsLiteLLM"
 
 var (
@@ -29,6 +29,50 @@ var (
 	maxDelay       = 5 * time.Second
 	jitterFactor   = 0.2
 )
+
+// Logger provides structured leveled logging.
+type Logger struct {
+	mu    sync.RWMutex
+	level int // 0=ERROR, 1=WARN, 2=INFO
+}
+
+func NewLogger(level string) *Logger {
+	l := &Logger{level: 2}
+	switch level {
+	case "error":
+		l.level = 0
+	case "warn":
+		l.level = 1
+	}
+	return l
+}
+
+func (l *Logger) SetLevel(level string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch level {
+	case "error":
+		l.level = 0
+	case "warn":
+		l.level = 1
+	default:
+		l.level = 2
+	}
+}
+
+func (l *Logger) logf(level string, lvl int, format string, args ...interface{}) {
+	l.mu.RLock()
+	if l.level < lvl {
+		l.mu.RUnlock()
+		return
+	}
+	l.mu.RUnlock()
+	log.Printf("[%s] [%s] %s", RepoName, level, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) Infof(format string, args ...interface{})  { l.logf("INFO", 2, format, args...) }
+func (l *Logger) Warnf(format string, args ...interface{})  { l.logf("WARN", 1, format, args...) }
+func (l *Logger) Errorf(format string, args ...interface{}) { l.logf("ERROR", 0, format, args...) }
 
 // UsageTracker records request metrics for quota monitoring.
 type UsageTracker struct {
@@ -73,6 +117,7 @@ type Client struct {
 	APIKey   string
 	Client   *http.Client
 	Usage    *UsageTracker
+	Logger   *Logger
 }
 
 func NewClient(endpoint, apiKey string) *Client {
@@ -84,6 +129,7 @@ func NewClient(endpoint, apiKey string) *Client {
 		APIKey:   apiKey,
 		Client:   &http.Client{Timeout: 30 * time.Second},
 		Usage:    &UsageTracker{},
+		Logger:   NewLogger(os.Getenv("TARS_LOG_LEVEL")),
 	}
 }
 
@@ -105,7 +151,7 @@ func (c *Client) reqWithRetry(ctx context.Context, method, path string, body int
 		}
 		if attempt < maxRetries {
 			delay := calculateBackoff(attempt)
-			log.Printf("[%s] retry %d/%d after %v: %v", RepoName, attempt+1, maxRetries, delay, err)
+			c.Logger.Warnf("retry %d/%d after %v: %v", attempt+1, maxRetries, delay, err)
 			select {
 			case <-ctx.Done():
 				c.Usage.Record(false, time.Since(start).Milliseconds())
@@ -193,7 +239,7 @@ func (c *Client) ReloadConfig() {
 	if cfg["api_key"] != "" {
 		c.APIKey = cfg["api_key"]
 	}
-	log.Printf("[%s] config reloaded endpoint=%s", RepoName, c.Endpoint)
+	c.Logger.Infof("config reloaded endpoint=%s", c.Endpoint)
 }
 
 func main() {
@@ -206,7 +252,7 @@ func main() {
 	}
 	cfg := loadConfig()
 	client := NewClient(cfg["endpoint"], cfg["api_key"])
-	log.Printf("[%s] starting v%s endpoint=%s", RepoName, Version, cfg["endpoint"])
+	client.Logger.Infof("starting v%s endpoint=%s", Version, cfg["endpoint"])
 	mode := os.Getenv("TARS_MCP_MODE")
 	if mode == "" {
 		mode = "stdio"
@@ -223,7 +269,7 @@ func main() {
 				client.ReloadConfig()
 				continue
 			}
-			log.Printf("[%s] shutting down", RepoName)
+			client.Logger.Infof("shutting down")
 			_ = srv.Close()
 			return
 		}
@@ -232,8 +278,9 @@ func main() {
 		runStdioServer(client)
 		return
 	}
-	log.Printf("[%s] HTTP listening on %s", RepoName, srv.Addr)
+	client.Logger.Infof("HTTP listening on %s", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		client.Logger.Errorf("server error: %v", err)
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -351,7 +398,7 @@ func invokeHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 }
 
 func runStdioServer(client *Client) {
-	log.Printf("[%s] stdio mode", RepoName)
+	client.Logger.Infof("stdio mode")
 	dec := json.NewDecoder(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
 	for {
