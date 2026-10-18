@@ -14,11 +14,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-var Version = "1.1.0"
+var Version = "1.2.0"
 const RepoName = "TarsLiteLLM"
 
 var (
@@ -28,10 +30,48 @@ var (
 	jitterFactor   = 0.2
 )
 
+// UsageTracker records request metrics for quota monitoring.
+type UsageTracker struct {
+	mu        sync.RWMutex
+	Requests  int64
+	Successes int64
+	Failures  int64
+	TotalMs   int64
+}
+
+func (u *UsageTracker) Record(success bool, latencyMs int64) {
+	atomic.AddInt64(&u.Requests, 1)
+	atomic.AddInt64(&u.TotalMs, latencyMs)
+	if success {
+		atomic.AddInt64(&u.Successes, 1)
+	} else {
+		atomic.AddInt64(&u.Failures, 1)
+	}
+}
+
+func (u *UsageTracker) Snapshot() map[string]interface{} {
+	return map[string]interface{}{
+		"requests":  atomic.LoadInt64(&u.Requests),
+		"successes": atomic.LoadInt64(&u.Successes),
+		"failures":  atomic.LoadInt64(&u.Failures),
+		"total_ms":  atomic.LoadInt64(&u.TotalMs),
+		"avg_ms":    u.avgMs(),
+	}
+}
+
+func (u *UsageTracker) avgMs() float64 {
+	r := atomic.LoadInt64(&u.Requests)
+	if r == 0 {
+		return 0
+	}
+	return float64(atomic.LoadInt64(&u.TotalMs)) / float64(r)
+}
+
 type Client struct {
 	Endpoint string
 	APIKey   string
 	Client   *http.Client
+	Usage    *UsageTracker
 }
 
 func NewClient(endpoint, apiKey string) *Client {
@@ -42,20 +82,24 @@ func NewClient(endpoint, apiKey string) *Client {
 		Endpoint: strings.TrimRight(endpoint, "/"),
 		APIKey:   apiKey,
 		Client:   &http.Client{Timeout: 30 * time.Second},
+		Usage:    &UsageTracker{},
 	}
 }
 
 // reqWithRetry performs HTTP request with exponential backoff retry.
 func (c *Client) reqWithRetry(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+	start := time.Now()
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		result, err := c.reqOnce(ctx, method, path, body)
 		if err == nil {
+			c.Usage.Record(true, time.Since(start).Milliseconds())
 			return result, nil
 		}
 		lastErr = err
 		// Don't retry on client errors (4xx)
 		if strings.Contains(err.Error(), "HTTP 4") {
+			c.Usage.Record(false, time.Since(start).Milliseconds())
 			return nil, err
 		}
 		if attempt < maxRetries {
@@ -63,21 +107,21 @@ func (c *Client) reqWithRetry(ctx context.Context, method, path string, body int
 			log.Printf("[%s] retry %d/%d after %v: %v", RepoName, attempt+1, maxRetries, delay, err)
 			select {
 			case <-ctx.Done():
+				c.Usage.Record(false, time.Since(start).Milliseconds())
 				return nil, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 	}
+	c.Usage.Record(false, time.Since(start).Milliseconds())
 	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
 }
 
 func calculateBackoff(attempt int) time.Duration {
-	// Exponential backoff: baseDelay * 2^attempt
 	delay := float64(baseDelay) * math.Pow(2, float64(attempt))
 	if delay > float64(maxDelay) {
 		delay = float64(maxDelay)
 	}
-	// Add jitter: +/- jitterFactor, but cap at maxDelay
 	jitter := delay * jitterFactor * (2*rand.Float64() - 1)
 	result := delay + jitter
 	if result > float64(maxDelay) {
@@ -197,6 +241,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 		"version":  Version,
 		"name":     RepoName,
 		"upstream": up,
+		"usage":    client.Usage.Snapshot(),
 		"time":     time.Now().UTC().Format(time.RFC3339),
 	})
 }

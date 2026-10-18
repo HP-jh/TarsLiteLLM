@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,5 +152,65 @@ func TestCalculateBackoff(t *testing.T) {
 	b10 := calculateBackoff(10)
 	if b10 > maxDelay {
 		t.Fatalf("backoff should not exceed maxDelay: %v > %v", b10, maxDelay)
+	}
+}
+
+// v1.2.0: usage tracking tests
+func TestUsageTracker_RecordAndSnapshot(t *testing.T) {
+	ut := &UsageTracker{}
+	ut.Record(true, 100)
+	ut.Record(false, 200)
+	ut.Record(true, 300)
+	snap := ut.Snapshot()
+	if snap["requests"].(int64) != 3 {
+		t.Fatalf("expected 3 requests, got %v", snap["requests"])
+	}
+	if snap["successes"].(int64) != 2 {
+		t.Fatalf("expected 2 successes, got %v", snap["successes"])
+	}
+	if snap["failures"].(int64) != 1 {
+		t.Fatalf("expected 1 failure, got %v", snap["failures"])
+	}
+	if snap["avg_ms"].(float64) != 200.0 {
+		t.Fatalf("expected avg 200ms, got %v", snap["avg_ms"])
+	}
+}
+
+func TestUsageTracker_Concurrent(t *testing.T) {
+	ut := &UsageTracker{}
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ut.Record(true, 10)
+		}()
+	}
+	wg.Wait()
+	if atomic.LoadInt64(&ut.Requests) != 100 {
+		t.Fatalf("expected 100 requests, got %d", atomic.LoadInt64(&ut.Requests))
+	}
+}
+
+func TestHealthHandler_IncludesUsage(t *testing.T) {
+	client := NewClient("", "")
+	// healthHandler itself calls client.req, so we just verify usage appears
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	withClient(client, healthHandler)(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	usage, ok := resp["usage"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected usage in health response")
+	}
+	// healthHandler makes 1 upstream request, so requests >= 1
+	if usage["requests"].(float64) < 1 {
+		t.Fatalf("expected >=1 request in usage, got %v", usage["requests"])
 	}
 }
