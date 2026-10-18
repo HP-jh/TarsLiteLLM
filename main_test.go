@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -213,4 +214,65 @@ func TestHealthHandler_IncludesUsage(t *testing.T) {
 	if usage["requests"].(float64) < 1 {
 		t.Fatalf("expected >=1 request in usage, got %v", usage["requests"])
 	}
+}
+
+// v1.3.0: config reload tests
+func TestReloadConfig(t *testing.T) {
+	os.Setenv("TARS_MCP_ENDPOINT", "https://new.example.com")
+	os.Setenv("TARS_MCP_API_KEY", "new-key")
+	defer os.Unsetenv("TARS_MCP_ENDPOINT")
+	defer os.Unsetenv("TARS_MCP_API_KEY")
+
+	client := NewClient("https://old.example.com", "old-key")
+	client.ReloadConfig()
+
+	if client.Endpoint != "https://new.example.com" {
+		t.Fatalf("expected endpoint https://new.example.com, got %s", client.Endpoint)
+	}
+	if client.APIKey != "new-key" {
+		t.Fatalf("expected api_key new-key, got %s", client.APIKey)
+	}
+}
+
+func TestReloadConfig_Partial(t *testing.T) {
+	// Only endpoint env set, api_key should stay
+	os.Setenv("TARS_MCP_ENDPOINT", "https://partial.example.com")
+	defer os.Unsetenv("TARS_MCP_ENDPOINT")
+
+	client := NewClient("https://old.example.com", "keep-key")
+	client.ReloadConfig()
+
+	if client.Endpoint != "https://partial.example.com" {
+		t.Fatalf("expected endpoint updated, got %s", client.Endpoint)
+	}
+	if client.APIKey != "keep-key" {
+		t.Fatalf("expected api_key unchanged, got %s", client.APIKey)
+	}
+}
+
+func TestClientReq_ConcurrentWithReload(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	client := NewClient(srv.URL, "test-key")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = client.req(context.Background(), "GET", "/health", nil)
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client.ReloadConfig()
+		}()
+	}
+	wg.Wait()
 }

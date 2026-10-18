@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-var Version = "1.2.0"
+var Version = "1.3.0"
 const RepoName = "TarsLiteLLM"
 
 var (
@@ -68,6 +68,7 @@ func (u *UsageTracker) avgMs() float64 {
 }
 
 type Client struct {
+	mu       sync.RWMutex
 	Endpoint string
 	APIKey   string
 	Client   *http.Client
@@ -134,17 +135,21 @@ func calculateBackoff(attempt int) time.Duration {
 }
 
 func (c *Client) reqOnce(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+	c.mu.RLock()
+	endpoint := c.Endpoint
+	apiKey := c.APIKey
+	c.mu.RUnlock()
 	var bodyR io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		bodyR = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.Endpoint+path, bodyR)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint+path, bodyR)
 	if err != nil {
 		return nil, err
 	}
-	if c.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -177,6 +182,20 @@ func loadConfig() map[string]string {
 	}
 }
 
+// ReloadConfig updates client endpoint and API key from current env.
+func (c *Client) ReloadConfig() {
+	cfg := loadConfig()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cfg["endpoint"] != "" {
+		c.Endpoint = strings.TrimRight(cfg["endpoint"], "/")
+	}
+	if cfg["api_key"] != "" {
+		c.APIKey = cfg["api_key"]
+	}
+	log.Printf("[%s] config reloaded endpoint=%s", RepoName, c.Endpoint)
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	version := flag.Bool("version", false, "print version and exit")
@@ -198,10 +217,16 @@ func main() {
 	http.HandleFunc("/invoke", func(w http.ResponseWriter, r *http.Request) { withClient(client, invokeHandler)(w, r) })
 	go func() {
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		log.Printf("[%s] shutting down", RepoName)
-		_ = srv.Close()
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		for sig := range sigCh {
+			if sig == syscall.SIGHUP {
+				client.ReloadConfig()
+				continue
+			}
+			log.Printf("[%s] shutting down", RepoName)
+			_ = srv.Close()
+			return
+		}
 	}()
 	if mode == "stdio" {
 		runStdioServer(client)

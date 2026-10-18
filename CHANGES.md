@@ -11,3 +11,9 @@
 - **新增**：健康检查 `/health` 端点暴露实时用量快照
 - **优化**：每个请求自动记录延迟与结果，无需手动埋点
 - **测试**：新增 `TestUsageTracker_RecordAndSnapshot`、`TestUsageTracker_Concurrent`、`TestHealthHandler_IncludesUsage`
+
+## v1.3.0 · 集成版本 — 配置热重载
+- **新增**：`Client.ReloadConfig()` 方法，从环境变量重新读取配置
+- **新增**：SIGHUP 信号触发配置热重载，无需重启进程
+- **优化**：`Client.mu` 读写锁保护并发配置更新与请求执行
+- **测试**：新增 `TestReloadConfig`、`TestReloadConfig_Partial`、`TestClientReq_ConcurrentWithReload`
